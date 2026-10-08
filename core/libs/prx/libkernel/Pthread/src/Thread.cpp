@@ -19,6 +19,7 @@
 #ifndef _WIN32
 #include <csetjmp>
 #include <pthread.h>
+#include <unistd.h>
 #endif
 
 static constexpr int SCE_OK = 0;
@@ -316,12 +317,23 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         ReleaseThread(published);
 #else
     auto* self = p.get();
-    p->_thr = std::thread([self, args = std::move(args), ready = start.get_future()]() mutable {
+    std::promise<void> identified;
+    auto identity = identified.get_future();
+    p->_thr = std::thread([self, args = std::move(args), ready = start.get_future(), identified = std::move(identified)]() mutable {
+        {
+            std::lock_guard lock(self->deliveryLock);
+            self->nativeTid = static_cast<int>(gettid());
+        }
+        identified.set_value();
         if (!ready.get()) return;
         self->threadId = std::this_thread::get_id();
         struct ThreadGuard {
             PthreadPrivate* self;
             ~ThreadGuard() {
+                {
+                    std::lock_guard lock(self->deliveryLock);
+                    self->nativeTid = 0;
+                }
                 currentThread = nullptr;
                 ReleaseThread(self);
             }
@@ -333,6 +345,7 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         }
         threadExitJump = nullptr;
     });
+    identity.get();
     try {
         if (detached) p->_thr.detach();
     } catch (...) {
@@ -418,6 +431,7 @@ Pthread APS5_VABI scePthreadSelf() {
         adoptedThread->_detached = true;
         adoptedThread->_adopted = true;
         adoptedThread->threadId = std::this_thread::get_id();
+        adoptedThread->nativeTid = static_cast<int>(gettid());
         SetStackFromHost(adoptedThread.get());
         currentThread = adoptedThread.get();
     }

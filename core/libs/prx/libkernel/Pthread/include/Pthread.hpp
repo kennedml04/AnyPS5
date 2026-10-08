@@ -80,6 +80,8 @@ struct PthreadPrivate {
     void* nativeHandle = nullptr;
 #else
     std::thread _thr;
+    std::mutex deliveryLock;
+    int nativeTid = 0;
 #endif
     std::thread::id threadId;
     std::atomic<unsigned> references{2};

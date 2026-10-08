@@ -11,6 +11,12 @@
 #include <stdexcept>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
 #endif
 
 extern "C" Pthread APS5_VABI scePthreadSelf();
@@ -83,6 +89,7 @@ static_assert(offsetof(GuestUcontext, mcontext) + offsetof(GuestMcontext, rsp) =
 using GuestExceptionHandler = void (APS5_VABI *)(int, void*);
 
 constexpr std::array<int, 6> AllowedSignals{1, 4, 8, 10, 11, 30};
+constexpr int RaisableSignal = 30;
 
 std::mutex handlersLock;
 std::array<void*, 32> handlers{};
@@ -236,6 +243,102 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     ResumeThread(native);
     return true;
 }
+#else
+std::once_flag deliveryInstalled;
+int deliverySignal = 0;
+
+void Deliver(int, siginfo_t* info, void* raw) {
+    const auto handler = reinterpret_cast<GuestExceptionHandler>(info->si_value.sival_ptr);
+    auto& host = static_cast<ucontext_t*>(raw)->uc_mcontext;
+    auto* g = host.gregs;
+    GuestUcontext ucontext{};
+    auto& m = ucontext.mcontext;
+    m.rdi = static_cast<std::uint64_t>(g[REG_RDI]);
+    m.rsi = static_cast<std::uint64_t>(g[REG_RSI]);
+    m.rdx = static_cast<std::uint64_t>(g[REG_RDX]);
+    m.rcx = static_cast<std::uint64_t>(g[REG_RCX]);
+    m.r8 = static_cast<std::uint64_t>(g[REG_R8]);
+    m.r9 = static_cast<std::uint64_t>(g[REG_R9]);
+    m.rax = static_cast<std::uint64_t>(g[REG_RAX]);
+    m.rbx = static_cast<std::uint64_t>(g[REG_RBX]);
+    m.rbp = static_cast<std::uint64_t>(g[REG_RBP]);
+    m.r10 = static_cast<std::uint64_t>(g[REG_R10]);
+    m.r11 = static_cast<std::uint64_t>(g[REG_R11]);
+    m.r12 = static_cast<std::uint64_t>(g[REG_R12]);
+    m.r13 = static_cast<std::uint64_t>(g[REG_R13]);
+    m.r14 = static_cast<std::uint64_t>(g[REG_R14]);
+    m.r15 = static_cast<std::uint64_t>(g[REG_R15]);
+    m.rip = static_cast<std::uint64_t>(g[REG_RIP]);
+    m.rsp = static_cast<std::uint64_t>(g[REG_RSP]);
+    m.rflags = static_cast<std::uint64_t>(g[REG_EFL]);
+    m.cs = static_cast<std::uint64_t>(g[REG_CSGSFS]) & 0xffff;
+    m.ss = static_cast<std::uint64_t>(g[REG_CSGSFS]) >> 48;
+    m.len = sizeof(GuestMcontext);
+    static_assert(sizeof(*host.fpregs) <= sizeof(m.fpstate));
+    if (host.fpregs != nullptr) std::memcpy(m.fpstate, host.fpregs, sizeof(*host.fpregs));
+    handler(RaisableSignal, &ucontext);
+    g[REG_RDI] = static_cast<greg_t>(m.rdi);
+    g[REG_RSI] = static_cast<greg_t>(m.rsi);
+    g[REG_RDX] = static_cast<greg_t>(m.rdx);
+    g[REG_RCX] = static_cast<greg_t>(m.rcx);
+    g[REG_R8] = static_cast<greg_t>(m.r8);
+    g[REG_R9] = static_cast<greg_t>(m.r9);
+    g[REG_RAX] = static_cast<greg_t>(m.rax);
+    g[REG_RBX] = static_cast<greg_t>(m.rbx);
+    g[REG_RBP] = static_cast<greg_t>(m.rbp);
+    g[REG_R10] = static_cast<greg_t>(m.r10);
+    g[REG_R11] = static_cast<greg_t>(m.r11);
+    g[REG_R12] = static_cast<greg_t>(m.r12);
+    g[REG_R13] = static_cast<greg_t>(m.r13);
+    g[REG_R14] = static_cast<greg_t>(m.r14);
+    g[REG_R15] = static_cast<greg_t>(m.r15);
+    g[REG_RIP] = static_cast<greg_t>(m.rip);
+    g[REG_RSP] = static_cast<greg_t>(m.rsp);
+    g[REG_EFL] = static_cast<greg_t>(m.rflags);
+    if (host.fpregs != nullptr) std::memcpy(host.fpregs, m.fpstate, sizeof(*host.fpregs));
+}
+
+void InstallDelivery() {
+    deliverySignal = SIGRTMIN;
+    struct sigaction action{};
+    action.sa_sigaction = Deliver;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(deliverySignal, &action, nullptr) != 0)
+        throw std::runtime_error("sceKernelRaiseException: cannot install the delivery signal handler");
+}
+
+bool Queue(int tid, GuestExceptionHandler handler) {
+    siginfo_t info{};
+    info.si_signo = deliverySignal;
+    info.si_code = SI_QUEUE;
+    info.si_pid = getpid();
+    info.si_uid = getuid();
+    info.si_value.sival_ptr = reinterpret_cast<void*>(handler);
+    if (syscall(SYS_rt_tgsigqueueinfo, getpid(), tid, deliverySignal, &info) == 0) return true;
+    if (errno == ESRCH) return false;
+    throw std::runtime_error("sceKernelRaiseException: cannot signal the target thread");
+}
+
+bool RaiseOn(Pthread thread, GuestExceptionHandler handler) {
+    std::call_once(deliveryInstalled, InstallDelivery);
+    if (thread == scePthreadSelf()) return Queue(static_cast<int>(gettid()), handler);
+    sigset_t delivery;
+    sigset_t previous;
+    sigemptyset(&delivery);
+    sigaddset(&delivery, deliverySignal);
+    pthread_sigmask(SIG_BLOCK, &delivery, &previous);
+    bool queued = false;
+    try {
+        std::lock_guard lock(thread->deliveryLock);
+        queued = thread->nativeTid != 0 && Queue(thread->nativeTid, handler);
+    } catch (...) {
+        pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+        throw;
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    return queued;
+}
 #endif
 
 }
@@ -284,15 +387,14 @@ int APS5_VABI sceKernelRemoveExceptionHandler(int signum) {
 }
 
 int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
- if (signum != 30) return SCE_KERNEL_ERROR_EINVAL;
+ if (signum != RaisableSignal) return SCE_KERNEL_ERROR_EINVAL;
  if (thread == nullptr || thread->_finished.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
  const auto handler = Handler(signum);
  if (handler == nullptr) throw std::runtime_error("sceKernelRaiseException: no handler installed for the signal");
 #ifdef _WIN32
  return RaiseOn(thread, handler, signum) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 #else
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return RaiseOn(thread, handler) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 #endif
 }
 
